@@ -1,3 +1,21 @@
+/**
+ * SocketContext.tsx
+ * =================
+ * Real-time messaging layer for LinguaFlow.
+ *
+ * This context manages a single Socket.IO connection per logged-in
+ * user.  It provides:
+ *  - **Connection state** (`isConnected`)
+ *  - **Presence tracking** (`onlineUsers`)
+ *  - **Message store** (`messages`) for the current session
+ *  - **Room management** (`joinRoom`, `leaveRoom`)
+ *  - **Sending messages** (`sendMessage`) — both text and audio
+ *  - **Typing indicator** (`setTyping`)
+ *
+ * The socket automatically connects when a user is logged in
+ * and disconnects on logout or component unmount.
+ */
+
 import {
   createContext,
   useContext,
@@ -11,38 +29,77 @@ import { io, type Socket } from "socket.io-client";
 import { useUser } from "./UserContext";
 import type { User } from "@/types";
 
+/** Backend URL for the Socket.IO server (defaults to localhost:3001) */
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || "http://localhost:3001";
 
+/**
+ * Shape of a chat message travelling over the socket.
+ * Both text and audio messages use this interface.
+ * - `type: "text"` — `content` holds the text body.
+ * - `type: "audio"` — `audioUrl` holds a data-URL or HTTP URL
+ *    to the audio file; `content` is a label like "🎤 Voice message".
+ */
 export interface ChatMessage {
+  /** Unique message ID (timestamp + userId by convention) */
   id: string;
+  /** Room (conversation) this message belongs to */
   roomId: string;
+  /** Text body — or label for audio messages */
   content: string;
+  /** Who sent this message */
   senderId: string;
+  /** Human-readable sender name */
   senderName: string;
+  /** When the message was created */
   timestamp: Date;
+  /** "text" for plain text, "audio" for voice / synthesised */
   type: "text" | "audio";
+  /** If the message was translated before sending, the original text */
   translatedText?: string;
+  /** Audio data URL (base64) or HTTP URL for audio messages */
   audioUrl?: string;
 }
 
+/** Values exposed to consumers via useSocketCtx() */
 interface SocketContextType {
+  /** Raw Socket.IO client (rarely needed directly) */
   socket: Socket | null;
+  /** Whether the socket is currently connected to the server */
   isConnected: boolean;
+  /** List of users who are currently online */
   onlineUsers: User[];
+  /** All messages received/sent during this session */
   messages: ChatMessage[];
+  /** Send a ChatMessage to the server and add it to local state */
   sendMessage: (message: ChatMessage) => void;
+  /** Join a chat room (1-on-1 conversation) */
   joinRoom: (roomId: string) => void;
+  /** Leave a chat room */
   leaveRoom: (roomId: string) => void;
+  /** Emit a typing indicator to the other participant */
   setTyping: (roomId: string, isTyping: boolean) => void;
+  /** Map of roomId → number of unread messages (from others) */
+  unreadCounts: Record<string, number>;
+  /** Reset the unread count for a specific room to 0 */
+  markRoomRead: (roomId: string) => void;
+  /** The most recently received message from another user (for toast) */
+  lastReceivedMessage: ChatMessage | null;
 }
 
 const SocketContext = createContext<SocketContextType | undefined>(undefined);
 
-/** Build a deterministic room ID from two user IDs */
+/**
+ * Build a deterministic room ID from two user IDs.
+ * Sorts alphabetically so both users always compute the same room.
+ */
 export function buildRoomId(userA: string, userB: string): string {
   return [userA, userB].sort().join("__");
 }
 
+/**
+ * SocketProvider
+ * Wraps the app and manages a single Socket.IO connection + message state.
+ */
 export function SocketProvider({ children }: { children: ReactNode }) {
   const { user } = useUser();
   const socketRef = useRef<Socket | null>(null);
@@ -50,6 +107,12 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   const [onlineUsers, setOnlineUsers] = useState<User[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const currentRoomRef = useRef<string | null>(null);
+
+  /** Tracks unread message count per room */
+  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
+  /** The most recently received message from another user (drives toast popup) */
+  const [lastReceivedMessage, setLastReceivedMessage] =
+    useState<ChatMessage | null>(null);
 
   // ---- socket lifecycle (runs once per user login) ----
   useEffect(() => {
@@ -122,6 +185,19 @@ export function SocketProvider({ children }: { children: ReactNode }) {
           { ...msg, timestamp: new Date(msg.timestamp) },
         ];
       });
+
+      // Track unread: if this message is NOT in the currently opened room,
+      // increment the unread counter for that room.
+      const incomingRoomId = msg.roomId;
+      if (incomingRoomId !== currentRoomRef.current) {
+        setUnreadCounts((prev) => ({
+          ...prev,
+          [incomingRoomId]: (prev[incomingRoomId] || 0) + 1,
+        }));
+      }
+
+      // Store the message so Home.tsx can show a toast notification
+      setLastReceivedMessage({ ...msg, timestamp: new Date(msg.timestamp) });
     });
 
     return () => {
@@ -134,6 +210,8 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   }, [user?.userId]);
 
   // ---- actions ----
+
+  /** Send a message via the socket and add it to local state immediately */
   const sendMessage = useCallback((message: ChatMessage) => {
     if (socketRef.current?.connected) {
       socketRef.current.emit("message:send", message);
@@ -147,6 +225,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  /** Join a specific chat room (leave the previous one first) */
   const joinRoom = useCallback((roomId: string) => {
     if (socketRef.current?.connected) {
       // Leave previous room first
@@ -155,9 +234,18 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       }
       socketRef.current.emit("chat:join", roomId);
       currentRoomRef.current = roomId;
+
+      // Clear unread count for this room since the user is now viewing it
+      setUnreadCounts((prev) => {
+        if (!prev[roomId]) return prev;
+        const next = { ...prev };
+        delete next[roomId];
+        return next;
+      });
     }
   }, []);
 
+  /** Leave a chat room so we stop receiving its events */
   const leaveRoom = useCallback((roomId: string) => {
     if (socketRef.current?.connected) {
       socketRef.current.emit("chat:leave", roomId);
@@ -165,6 +253,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  /** Notify the other participant that this user is/isn't typing */
   const setTyping = useCallback(
     (roomId: string, isTyping: boolean) => {
       if (socketRef.current?.connected && user) {
@@ -178,6 +267,16 @@ export function SocketProvider({ children }: { children: ReactNode }) {
     [user],
   );
 
+  /** Reset the unread count for a given room (e.g. when opening the chat) */
+  const markRoomRead = useCallback((roomId: string) => {
+    setUnreadCounts((prev) => {
+      if (!prev[roomId]) return prev;
+      const next = { ...prev };
+      delete next[roomId];
+      return next;
+    });
+  }, []);
+
   return (
     <SocketContext.Provider
       value={{
@@ -189,6 +288,9 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         joinRoom,
         leaveRoom,
         setTyping,
+        unreadCounts,
+        markRoomRead,
+        lastReceivedMessage,
       }}
     >
       {children}
@@ -196,6 +298,10 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   );
 }
 
+/**
+ * Hook to consume the socket context.
+ * Must be called inside a <SocketProvider>.
+ */
 export function useSocketCtx() {
   const ctx = useContext(SocketContext);
   if (!ctx) throw new Error("useSocketCtx must be used within SocketProvider");

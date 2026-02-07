@@ -1,26 +1,66 @@
+/**
+ * server.js
+ * =========
+ * Express + Socket.IO backend for the LinguaFlow chat application.
+ *
+ * This server has two main roles:
+ *
+ * 1. **API Proxy** — Relays TTS, ASR, and Translation requests to
+ *    the Hypa AI API (api.hypaintelligence.com) so the browser
+ *    never needs to expose the API key.
+ *
+ * 2. **Real-time Messaging** — Uses Socket.IO to handle:
+ *    - User presence (join / disconnect / online list)
+ *    - Chat rooms (join / leave)
+ *    - Message broadcasting
+ *    - Typing indicators
+ *
+ * Environment variables (optional, see .env):
+ *   HYPA_API_URL  — base URL for Hypa AI (default: https://api.hypaintelligence.com/v2/developer)
+ *   HYPA_API_KEY  — API key for authentication
+ *   PORT          — listen port (default: 3001)
+ */
+
 const express = require('express');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 require('dotenv').config();
 
+/** Create the Express app and wrap it in an HTTP server (needed by Socket.IO) */
 const app = express();
 const httpServer = createServer(app);
 
-// Middleware
+// ─── Middleware ───
+// CORS allows the Vite dev server (different port) to call our API.
+// The 50 MB limit is required because audio base64 payloads can be large.
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
+/** Hypa AI API base URL */
 const API_URL =
   process.env.HYPA_API_URL || 'https://api.hypaintelligence.com/v2/developer';
+/** Hypa AI API key (sent as x-api-key header) */
 const API_KEY = process.env.HYPA_API_KEY || '';
 
-// Store connected users and their socket IDs
+// ────────────────────────────────────────────────────────────
+// In-Memory User Store
+// Tracks which users are online and maps socket IDs back to user IDs.
+// ────────────────────────────────────────────────────────────
+
+/** Map<userId, { socketId, userInfo }> — all currently connected users */
 const connectedUsers = new Map();
+/** Map<socketId, userId> — reverse lookup to find a userId from a socket */
 const userSockets = new Map();
 
-// Get list of all online users
+/**
+ * Build a list of all online users, optionally excluding one user.
+ * Used to send the “users:list” event when a user first connects.
+ *
+ * @param {string|null} excludeUserId — userId to omit (e.g. the requester)
+ * @returns {Array<{id, name, avatar, email}>}
+ */
 function getOnlineUsersList(excludeUserId = null) {
   const users = [];
   for (const [userId, data] of connectedUsers.entries()) {
@@ -37,7 +77,16 @@ function getOnlineUsersList(excludeUserId = null) {
 }
 
 // ==================== API ROUTES ====================
+// These endpoints act as a proxy between the browser and the
+// Hypa AI API so that the API key is never exposed to the client.
 
+/**
+ * POST /api/tts — Text-to-Speech
+ *
+ * Receives { text, provider, model, voice, language, ... } from the
+ * frontend, forwards it to the Hypa AI TTS endpoint, and normalises
+ * the response into { success, audio_base64, audio_url }.
+ */
 // Text-to-Speech API
 app.post('/api/tts', async (req, res) => {
   try {
@@ -114,6 +163,18 @@ app.post('/api/tts', async (req, res) => {
   }
 });
 
+/**
+ * POST /api/asr — Automatic Speech Recognition (Transcription)
+ *
+ * Receives { audio (base64), audio_type, provider, model, ... } from
+ * the frontend. Forwards to Hypa AI’s ASR endpoint.
+ * Returns { success, text } with the transcribed text.
+ *
+ * Handles multiple response formats:
+ *  - Direct JSON with `text` or `transcription` field
+ *  - SSE (Server-Sent Events) wrapper `data: {...}`
+ *  - OpenAI-style `choices[0].message.content`
+ */
 // Automatic Speech Recognition API
 app.post('/api/asr', async (req, res) => {
   try {
@@ -207,6 +268,16 @@ app.post('/api/asr', async (req, res) => {
   }
 });
 
+/**
+ * POST /api/mt — Machine Translation
+ *
+ * Receives { text, source_lang, target_lang, provider, model, ... }
+ * from the frontend. Forwards to Hypa AI’s /mt endpoint.
+ * Returns { success, translated_text }.
+ *
+ * Handles SSE and OpenAI-style response wrappers, and strips
+ * any <think>...</think> tags from the model output.
+ */
 // Translation API
 app.post('/api/mt', async (req, res) => {
   try {
@@ -291,13 +362,21 @@ app.post('/api/mt', async (req, res) => {
   }
 });
 
+/**
+ * GET /health — Simple health-check endpoint.
+ * Returns { status: 'ok', timestamp } so load balancers or monitoring
+ * tools can verify the server is alive.
+ */
 // Health check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 // ==================== SOCKET.IO ====================
+// Real-time communication layer.
+// Handles user presence, chat rooms, and message relay.
 
+/** Create the Socket.IO server with permissive CORS for development */
 const io = new Server(httpServer, {
   cors: {
     origin: '*',
@@ -308,6 +387,11 @@ const io = new Server(httpServer, {
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
+  /**
+   * user:join
+   * Called immediately after a client connects.
+   * Associates the socket with a userId so we can track presence.
+   */
   // User joins with their ID and info
   socket.on('user:join', (userData) => {
     const userId = typeof userData === 'string' ? userData : userData.id;
@@ -320,27 +404,45 @@ io.on('connection', (socket) => {
     connectedUsers.set(userId, { socketId: socket.id, userInfo });
     userSockets.set(socket.id, userId);
 
-    // Broadcast this user is online (with their info so others can see them)
-    io.emit('user:online', { userId, isOnline: true, userInfo });
-
-    // Send the complete list of online users to the newly connected user
+    // Send the complete list of online users to the newly connected user FIRST
+    // so their state is populated before any incremental updates arrive.
     const onlineUsers = getOnlineUsersList(userId);
     socket.emit('users:list', onlineUsers);
     console.log(`Sent ${onlineUsers.length} online users to ${userId}`);
+
+    // Then broadcast to OTHER users that this user came online.
+    // Using broadcast.emit (not io.emit) so the joining user doesn't
+    // receive their own online event, which could race with users:list.
+    socket.broadcast.emit('user:online', { userId, isOnline: true, userInfo });
   });
 
+  /**
+   * chat:join
+   * The client joins a specific chat room (1-on-1 conversation).
+   * Socket.IO rooms ensure messages are only sent to participants.
+   */
   // Join a chat room
   socket.on('chat:join', (chatId) => {
     socket.join(chatId);
     console.log(`Socket ${socket.id} joined chat ${chatId}`);
   });
 
+  /**
+   * chat:leave
+   * The client leaves a chat room.
+   */
   // Leave a chat room
   socket.on('chat:leave', (chatId) => {
     socket.leave(chatId);
     console.log(`Socket ${socket.id} left chat ${chatId}`);
   });
 
+  /**
+   * message:send
+   * Relay a chat message to all OTHER sockets in the room.
+   * The sender already has the message in their local state
+   * (optimistic update), so we use socket.to() not io.to().
+   */
   // Handle sending messages
   socket.on('message:send', (message) => {
     const roomId = message.roomId || message.chatId;
@@ -348,20 +450,51 @@ io.on('connection', (socket) => {
 
     // Broadcast to all OTHER users in the room (sender already has it locally)
     socket.to(roomId).emit('message:receive', message);
+
+    // Also send directly to the recipient's socket if they are NOT in the room.
+    // This ensures they receive the message even if they haven't opened the chat.
+    // The roomId format is "userA__userB" (sorted), so we extract both IDs.
+    const userIds = roomId.split('__');
+    const senderId = message.senderId;
+
+    for (const uid of userIds) {
+      if (uid !== senderId) {
+        const recipientData = connectedUsers.get(uid);
+        if (recipientData) {
+          const recipientSocket = io.sockets.sockets.get(recipientData.socketId);
+          if (recipientSocket && !recipientSocket.rooms.has(roomId)) {
+            // Recipient is online but hasn't joined the room — send directly
+            recipientSocket.emit('message:receive', message);
+          }
+        }
+      }
+    }
   });
 
+  /**
+   * user:typing
+   * Broadcast typing indicator to the other participant(s).
+   */
   // Handle typing indicators
   socket.on('user:typing', (data) => {
     const { chatId, userId, isTyping } = data;
     socket.to(chatId).emit('user:typing', { chatId, userId, isTyping });
   });
 
+  /**
+   * message:read
+   * Notify participants that a message has been read.
+   */
   // Handle message read status
   socket.on('message:read', (data) => {
     const { chatId, messageId, userId } = data;
     io.to(chatId).emit('message:read', { chatId, messageId, userId });
   });
 
+  /**
+   * disconnect
+   * Clean up presence data and notify other users.
+   */
   // Handle disconnect
   socket.on('disconnect', () => {
     const userId = userSockets.get(socket.id);
@@ -384,6 +517,7 @@ io.on('connection', (socket) => {
 
 // ==================== START SERVER ====================
 
+/** Port to listen on (default 3001 for development) */
 const PORT = process.env.PORT || 3001;
 
 httpServer.listen(PORT, () => {
@@ -402,6 +536,11 @@ httpServer.listen(PORT, () => {
   `);
 });
 
+/**
+ * Utility: get the machine’s local IPv4 address.
+ * Printed at startup so developers can access the server from
+ * other devices on the same network.
+ */
 // Get local IP for network access
 function getLocalIP() {
   const { networkInterfaces } = require('os');

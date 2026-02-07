@@ -1,3 +1,31 @@
+/**
+ * ChatView.tsx
+ * ============
+ * The main chat panel of LinguaFlow.
+ *
+ * Features
+ * --------
+ * 1. **Message display** — text & audio messages in speech-bubble style.
+ * 2. **Text input** — send plain text messages via Enter or Send button.
+ * 3. **Audio recording** — record from microphone, preview, and send as
+ *    a voice message (type="audio").
+ * 4. **Pre-send options** — before sending, the user can:
+ *    - "Translate & Send" — translate the text and send the translated
+ *      version (original is kept as metadata).
+ *    - "Synthesize & Send Voice" — convert the text to speech via TTS
+ *      and send as an audio message.
+ * 5. **Per-message actions** (hover dropdown):
+ *    - **Translate** — translate the message text into another language.
+ *    - **Synthesize (TTS)** — convert text to speech. Disabled for audio
+ *      messages (they are already audio).
+ *    - **Transcribe (ASR)** — convert audio to text. Enabled for audio
+ *      messages; shows a toast for text-only messages.
+ * 6. **Auto-translate** — when the user sets a non-English default
+ *    language in Settings, every incoming message is automatically
+ *    translated into that language on-screen. The original text is
+ *    always what gets sent over the socket.
+ */
+
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import {
   Send,
@@ -44,17 +72,28 @@ import {
   buildRoomId,
   type ChatMessage,
 } from "../context/SocketContext";
+import { useSettings } from "../context/SettingsContext";
 import { translateText, textToSpeech, transcribeAudio, audioUrlToBase64, fileToBase64 } from "@/services/api";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/utils";
 import type { TranslationLanguage, TranslationModel, TTSLanguage, TTSModel, TTSVoice, ASRModel } from "@/types";
 
+/* ─── Component props ─── */
 interface ChatViewProps {
+  /** The peer user ID this chat is with (null = no chat selected) */
   peerId: string | null;
+  /** Display name of the peer */
   peerName?: string;
+  /** Avatar URL (falls back to DiceBear) */
   peerAvatar?: string;
 }
 
+/* ============================================================
+   STATIC CONSTANT ARRAYS
+   These lists drive the <Select> dropdowns throughout the UI.
+   ============================================================ */
+
+/** All supported translation languages */
 const TRANSLATION_LANGUAGES: TranslationLanguage[] = [
   "English",
   "Yoruba",
@@ -69,6 +108,7 @@ const TRANSLATION_LANGUAGES: TranslationLanguage[] = [
   "Igala",
 ];
 
+/** Languages supported by the TTS (text-to-speech) engine */
 const TTS_LANGUAGES: TTSLanguage[] = [
   "english",
   "yoruba",
@@ -81,6 +121,7 @@ const TTS_LANGUAGES: TTSLanguage[] = [
   "tiv",
 ];
 
+/** Available TTS voices */
 const TTS_VOICES: TTSVoice[] = [
   "Eniola",
   "Juliet",
@@ -94,12 +135,14 @@ const TTS_VOICES: TTSVoice[] = [
   "David",
 ];
 
+/** Translation models available for the Hypa AI API */
 const TRANSLATION_MODELS: TranslationModel[] = [
   "hypa-llama3-2-8b-sft-2025-12-rvl",
   "hypa-llama3-1-8b-sft-2025-10-swn",
   "llama-3-2-8b-instruct-bnb-4b-ync",
 ];
 
+/** TTS models available via Hypa AI */
 const TTS_MODELS: TTSModel[] = [
   "hypaai-orpheus-v5-pqq",
   "Hypa-Orpheus-V4-new",
@@ -108,29 +151,52 @@ const TTS_MODELS: TTSModel[] = [
   "hypa-orpheus-3b-0-1-ft-unslo-ldl",
 ];
 
+/** ASR (speech-to-text) models available via Hypa AI */
 const ASR_MODELS: ASRModel[] = [
   "wspr-small-2025-11-11-12-12--mpk",
   "hypaai-whisper-base-v1-04292-lhy",
 ];
 
+/**
+ * ChatView component
+ * ------------------
+ * Renders the entire right-side chat panel: header, message list,
+ * input area, and all AI-feature dialogs (translate, synthesize,
+ * transcribe, pre-send translate, pre-send synthesize, results).
+ */
 export function ChatView({ peerId, peerName, peerAvatar }: ChatViewProps) {
+  /* ── Context hooks ── */
   const { user } = useUser();
   const { toast } = useToast();
   const { messages, sendMessage, joinRoom, leaveRoom } = useSocketCtx();
+  const { settings, isAutoTranslateEnabled } = useSettings();
+
+  /* ── Basic input & dropdown state ── */
   const [inputValue, setInputValue] = useState("");
   const [openDropdown, setOpenDropdown] = useState<string | null>(null);
   const [processingMessage] = useState<string | null>(null);
 
+  /* ============================================================
+     AUTO-TRANSLATE STATE
+     ============================================================
+     Keeps a map of messageId → translated text so each message
+     is translated at most once. Works for both sent & received.
+  */
+  const [autoTranslations, setAutoTranslations] = useState<Record<string, string>>({});
+  /** Set of message IDs currently being auto-translated (for loading UI) */
+  const [autoTranslating, setAutoTranslating] = useState<Set<string>>(new Set());
+
   // ---- Audio recording state ----
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordingDuration, setRecordingDuration] = useState(0);
-  const [recordedAudioUrl, setRecordedAudioUrl] = useState<string | null>(null);
-  const [recordedAudioBlob, setRecordedAudioBlob] = useState<Blob | null>(null);
-  const [isPlayingPreview, setIsPlayingPreview] = useState(false);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  // These track the microphone recording lifecycle
+  const [isRecording, setIsRecording] = useState(false);           // currently recording?
+  const [recordingDuration, setRecordingDuration] = useState(0);   // elapsed seconds
+  const [recordedAudioUrl, setRecordedAudioUrl] = useState<string | null>(null);   // blob URL for preview
+  const [recordedAudioBlob, setRecordedAudioBlob] = useState<Blob | null>(null);   // raw blob for sending
+  const [isPlayingPreview, setIsPlayingPreview] = useState(false); // playing the preview?
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);     // MediaRecorder instance
+  const audioChunksRef = useRef<Blob[]>([]);                       // chunks collected during recording
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null); // interval id
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);   // audio element for preview
 
   // ---- Pre-send dialog state ----
   const [preSendTranslateDialog, setPreSendTranslateDialog] = useState<{
@@ -222,6 +288,68 @@ export function ChatView({ peerId, peerName, peerAvatar }: ChatViewProps) {
     () => (roomId ? messages.filter((m) => m.roomId === roomId) : []),
     [messages, roomId],
   );
+
+  /* ============================================================
+     AUTO-TRANSLATE EFFECT
+     ============================================================
+     When auto-translate is enabled (user chose a non-English default
+     language), every NEW text message in the room is translated
+     in the background. The translated text is stored in
+     `autoTranslations[messageId]` and displayed in place of
+     `message.content` on this user's screen.
+
+     IMPORTANT: The original text is what goes over the socket.
+     Each user translates independently into their own language.
+  */
+  useEffect(() => {
+    if (!isAutoTranslateEnabled || roomMessages.length === 0) return;
+
+    // Find text messages that haven't been auto-translated yet
+    const untranslated = roomMessages.filter(
+      (m) =>
+        m.type === "text" &&
+        !autoTranslations[m.id] &&
+        !autoTranslating.has(m.id),
+    );
+
+    if (untranslated.length === 0) return;
+
+    // Mark these messages as "in-flight" to avoid duplicate requests
+    setAutoTranslating((prev) => {
+      const next = new Set(prev);
+      untranslated.forEach((m) => next.add(m.id));
+      return next;
+    });
+
+    // Fire off translations in parallel
+    untranslated.forEach(async (msg) => {
+      try {
+        const result = await translateText({
+          text: msg.content,
+          target_lang: settings.defaultLanguage,
+          source_lang: "Auto Detect" as TranslationLanguage,
+          provider: "hypaai",
+          model: settings.translationModel,
+          stream: false,
+        });
+        if (result.success && result.translated_text) {
+          setAutoTranslations((prev) => ({
+            ...prev,
+            [msg.id]: result.translated_text!,
+          }));
+        }
+      } catch {
+        // Silently ignore auto-translate failures
+      } finally {
+        setAutoTranslating((prev) => {
+          const next = new Set(prev);
+          next.delete(msg.id);
+          return next;
+        });
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomMessages.length, isAutoTranslateEnabled, settings.defaultLanguage]);
 
   // ---- Send ----
   const handleSend = () => {
@@ -711,6 +839,18 @@ export function ChatView({ peerId, peerName, peerAvatar }: ChatViewProps) {
             const isOwn = message.senderId === user?.userId;
             const translation = inlineTranslations[message.id];
             const audio = inlineAudio[message.id];
+            /**
+             * Auto-translation: if enabled, replace the displayed text
+             * with the auto-translated version. The original text is
+             * still stored in message.content.
+             */
+            const autoTrans = autoTranslations[message.id];
+            const isAutoTranslatingThis = autoTranslating.has(message.id);
+            /** The text to actually display in the bubble */
+            const displayContent =
+              autoTrans && message.type === "text"
+                ? autoTrans
+                : message.content;
 
             return (
               <div
@@ -734,7 +874,7 @@ export function ChatView({ peerId, peerName, peerAvatar }: ChatViewProps) {
                       </p>
                     )}
 
-                    {/* Audio message */}
+                    {/* Audio message — render an audio player */}
                     {message.type === "audio" && message.audioUrl ? (
                       <div>
                         <p className="text-[14.2px] leading-[19px] break-words mb-1.5">
@@ -745,9 +885,38 @@ export function ChatView({ peerId, peerName, peerAvatar }: ChatViewProps) {
                         </audio>
                       </div>
                     ) : (
+                      /* Text message — show auto-translated version if available */
                       <p className="text-[14.2px] leading-[19px] break-words">
-                        {message.content}
+                        {displayContent}
                       </p>
+                    )}
+
+                    {/* Auto-translating spinner indicator */}
+                    {isAutoTranslatingThis && message.type === "text" && (
+                      <div
+                        className={cn(
+                          "mt-1 flex items-center gap-1 text-[10px]",
+                          isOwn ? "text-white/60" : "text-gray-400",
+                        )}
+                      >
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        Translating...
+                      </div>
+                    )}
+
+                    {/* If auto-translated, show the original text */}
+                    {autoTrans && message.type === "text" && (
+                      <div
+                        className={cn(
+                          "mt-1 pt-1 border-t text-[11px] italic",
+                          isOwn
+                            ? "border-white/30 text-white/60"
+                            : "border-gray-200 dark:border-gray-700 text-gray-400 dark:text-gray-500",
+                        )}
+                      >
+                        <Languages className="inline w-3 h-3 mr-1 -mt-0.5" />
+                        Original: {message.content}
+                      </div>
                     )}
 
                     {/* Show original text if this was a translated send */}
@@ -837,6 +1006,7 @@ export function ChatView({ peerId, peerName, peerAvatar }: ChatViewProps) {
                         className="w-48"
                         onCloseAutoFocus={(e) => e.preventDefault()}
                       >
+                        {/* Translate — always available for any message type */}
                         <DropdownMenuItem
                           className="cursor-pointer gap-2"
                           onSelect={() =>
@@ -846,19 +1016,49 @@ export function ChatView({ peerId, peerName, peerAvatar }: ChatViewProps) {
                           <Languages className="w-4 h-4 text-indigo-600" />
                           Translate
                         </DropdownMenuItem>
+
+                        {/* Synthesize (TTS) — only for text messages.
+                            Audio messages are already audio, so this is disabled. */}
                         <DropdownMenuItem
                           className="cursor-pointer gap-2"
-                          onSelect={() =>
-                            openSynthesizeDialog(message.id, message.content)
-                          }
+                          disabled={message.type === "audio"}
+                          onSelect={() => {
+                            if (message.type === "audio") return;
+                            openSynthesizeDialog(message.id, message.content);
+                          }}
                         >
                           <Volume2 className="w-4 h-4 text-pink-600" />
                           Synthesize (TTS)
+                          {message.type === "audio" && (
+                            <span className="text-[10px] text-gray-400 ml-auto">already audio</span>
+                          )}
                         </DropdownMenuItem>
+
+                        {/* Transcribe (ASR) — only for audio messages.
+                            Text messages show a toast explaining transcribe is for audio only. */}
                         <DropdownMenuItem
                           className="cursor-pointer gap-2"
-                          onSelect={() => openTranscribeDialog(message.id)}
-                          disabled={!inlineAudio[message.id]}
+                          onSelect={() => {
+                            if (message.type === "text" && !message.audioUrl && !inlineAudio[message.id]) {
+                              toast({
+                                title: "Not Available",
+                                description:
+                                  "Transcribe is only available for voice messages, not text messages.",
+                              });
+                              return;
+                            }
+                            // For audio messages, use the message's own audioUrl
+                            if (message.type === "audio" && message.audioUrl) {
+                              setTranscribeDialog({
+                                open: true,
+                                messageId: message.id,
+                                audioUrl: message.audioUrl,
+                              });
+                              setOpenDropdown(null);
+                            } else {
+                              openTranscribeDialog(message.id);
+                            }
+                          }}
                         >
                           <FileText className="w-4 h-4 text-purple-600" />
                           Transcribe (ASR)
